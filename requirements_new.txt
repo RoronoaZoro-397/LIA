@@ -1,0 +1,70 @@
+# Core dependencies
+streamlit>=1.32.0
+python-dotenv>=1.0.0
+
+# LangChain ecosystem (compatible versions)
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-core>=0.3.0
+langchain-google-genai>=2.0.0
+langchain-text-splitters>=0.3.0
+
+# LlamaIndex ecosystem
+llama-index>=0.12.0
+llama-index-llms-gemini>=0.5.0
+llama-index-embeddings-gemini>=0.3.0
+llama-index-vector-stores-opensearch>=0.5.0
+llama-index-readers-file>=0.4.0
+llama-index-readers-google>=0.6.0
+llama-parse>=0.6.0
+
+# OpenSearch
+opensearch-py>=2.4.0
+
+# Google AI/Gemini
+google-generativeai>=0.8.0
+google-api-python-client>=2.0.0
+google-auth>=2.0.0
+google-auth-oauthlib>=1.0.0
+
+# spaCy for NLP
+spacy>=3.7.0
+
+# PDF processing
+PyMuPDF>=1.23.0
+pypdf>=5.0.0
+
+# Data science
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# HTTP and networking
+requests>=2.31.0
+httpx>=0.24.0
+urllib3>=1.26.0
+
+# Pydantic
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Async and concurrency
+anyio>=4.0.0
+aiohttp>=3.8.0
+
+# Utilities
+typing-extensions>=4.7.0
+packaging>=23.0
+certifi>=2023.0.0
+click>=8.0.0
+attrs>=23.0.0
+
+# Excel/Sheets support
+openpyxl>=3.1.0
+xlrd>=2.0.0
+
+# Pillow for image processing
+pillow>=10.0.0
+
+# Rich for better output
+rich>=13.0.0 

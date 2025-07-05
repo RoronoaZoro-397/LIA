@@ -1,0 +1,7 @@
+ringcentral_client
+pydash
+PyInquirer
+requests-download
+ringcentral_chatbot_factory
+ringcentral-chatbot-server
+jira
