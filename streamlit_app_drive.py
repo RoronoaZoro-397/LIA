@@ -201,6 +201,7 @@ def get_user_enhanced_metadata_path(user_email):
 def save_enhanced_file_metadata(file_metadata, user_email):
     """Save comprehensive metadata about processed files to both JSON and OpenSearch."""
     # Save to JSON file (for backward compatibility)
+    print(f"creating a metadata file for {user_email}")
     metadata_path = get_user_enhanced_metadata_path(user_email)
     os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
     
@@ -690,7 +691,7 @@ def download_pdf_from_drive(service, file_id, file_name, download_dir):
         print(f"Failed to download {file_name}: {str(e)}")
         return None
 
-def download_google_doc_content(service, file_id, file_name, file_info=None):
+def download_google_doc_content(service, file_id, file_name, file_info=None, user_email=None):
     """Download Google Doc content as text."""
     try:
         # Export Google Doc as plain text
@@ -743,7 +744,6 @@ def download_google_doc_content(service, file_id, file_name, file_info=None):
             enhanced_metadata = extract_file_metadata(file_info, 'google_doc', additional_info)
             
             # Get user email from session state
-            user_email = st.user_info.get('email', 'unknown') if hasattr(st, 'user_info') and st.user_info else 'unknown'
             
             # Save enhanced metadata
             save_enhanced_file_metadata({file_hash: enhanced_metadata}, user_email)
@@ -827,7 +827,7 @@ def extract_text_with_links(pdf_path):
         traceback.print_exc()
         return []
 
-def process_pdf_with_images(pdf_path, file_name, file_id, file_info=None):
+def process_pdf_with_images(pdf_path, file_name, file_id, file_info=None, user_email=None):
     """Process a PDF file to extract both text and images."""
     try:
         # Initialize Gemini Vision model
@@ -897,9 +897,6 @@ def process_pdf_with_images(pdf_path, file_name, file_id, file_info=None):
             # Store enhanced metadata
             file_hash = hashlib.md5(f"{file_id}_{file_info.get('modifiedTime', '')}".encode()).hexdigest()
             enhanced_metadata = extract_file_metadata(file_info, 'pdf', additional_info)
-            
-            # Get user email from session state
-            user_email = st.user_info.get('email', 'unknown') if hasattr(st, 'user_info') and st.user_info else 'unknown'
             
             # Save enhanced metadata
             save_enhanced_file_metadata({file_hash: enhanced_metadata}, user_email)
@@ -1380,11 +1377,20 @@ def create_mixed_query_response(pdf_chunks, sheets_chunks, query, llm, chat_hist
         else:
             response = "No files found containing the requested content."
         
-        return response
+        # Return document links in the same format as main query function
+        document_links = []
+        for file_meta in file_metadata_list:
+            document_links.append({
+                'name': file_meta.get('file_name', 'Unknown'),
+                'link': file_meta.get('web_view_link', ''),
+                'type': file_meta.get('file_type', 'document')
+            })
+        
+        return response, document_links
         
     except Exception as e:
         print(f"❌ Error creating mixed query response: {str(e)}")
-        return f"An error occurred while processing your query: {str(e)}"
+        return f"An error occurred while processing your query: {str(e)}", []
 
 def create_unified_response(pdf_chunks, sheets_chunks, query, llm, chat_history=None):
     """Create a unified response using all retrieved chunks in a single LLM call."""
@@ -1629,7 +1635,7 @@ def process_all_user_documents_unified(credentials, user_email):
                         continue
                     
                     # Extract text and images with enhanced metadata
-                    pdf_docs = process_pdf_with_images(pdf_path, file_name, file_id, pdf_file)
+                    pdf_docs = process_pdf_with_images(pdf_path, file_name, file_id, pdf_file, user_email)
                     if pdf_docs:
                         documents.extend(pdf_docs)
                         processed_count += 1
@@ -1665,7 +1671,7 @@ def process_all_user_documents_unified(credentials, user_email):
                 st.processing_status = f"📝 Processing Google Doc: {file_name}"
                 
                 # Download Google Doc content with enhanced metadata
-                doc = download_google_doc_content(service, file_id, file_name, doc_file)
+                doc = download_google_doc_content(service, file_id, file_name, doc_file,user_email)
                 if doc:
                     documents.append(doc)
                     processed_count += 1
@@ -2202,10 +2208,15 @@ def query_unified_system(prompt, unified_retriever, llm, chat_history=None, user
                 response = handle_metadata_query(prompt, user_email)
             else:
                 response = "❌ User email not available for metadata query processing."
+            # For metadata queries, return empty document links
+            return response, []
         else:
             print("📄 Handling content query...")
             # Retrieve relevant chunks from both sources with history context
             pdf_chunks, sheets_chunks = unified_retriever.retrieve_relevant_chunks(prompt, k_pdfs=20, k_sheets=10, chat_history=chat_history)
+            
+            # Initialize document links list
+            document_links = []
             
             print(f"📄 Retrieved {len(pdf_chunks)} PDF chunks and {len(sheets_chunks)} sheet chunks")
             
@@ -2246,17 +2257,85 @@ def query_unified_system(prompt, unified_retriever, llm, chat_history=None, user
             if is_mixed_query and user_email:
                 print("🔄 Detected mixed query - combining content search with metadata response...")
                 # Create content-based response but format it to show file metadata
-                response = create_mixed_query_response(pdf_chunks, sheets_chunks, prompt, llm, chat_history, user_email)
+                response, mixed_document_links = create_mixed_query_response(pdf_chunks, sheets_chunks, prompt, llm, chat_history, user_email)
+                # Use the document links from mixed query response
+                document_links = mixed_document_links
             else:
                 # Create unified response in a single LLM call with history
                 response = create_unified_response(pdf_chunks, sheets_chunks, prompt, llm, chat_history)
         
+        # Extract document links from chunks with enhanced metadata
+        document_links = []
+        
+        # Load enhanced metadata to get web_view_links
+        enhanced_metadata = {}
+        if user_email:
+            try:
+                enhanced_metadata = load_enhanced_file_metadata(user_email)
+            except Exception as e:
+                print(f"⚠️ Could not load enhanced metadata: {e}")
+        
+        # Extract document names that are actually referenced in the response
+        # Look for patterns like "Source: filename" or "filename" in the response
+        import re
+        referenced_docs = set()
+        
+        # Pattern to match "Source: filename" or "filename (Source: ...)"
+        source_patterns = [
+            r'Source:\s*([^,\n]+?\.(?:pdf|docx?|xlsx?))',
+            r'\(Source:\s*([^,\n]+?\.(?:pdf|docx?|xlsx?))',
+            r'from\s+([^,\n]+?\.(?:pdf|docx?|xlsx?))',
+            r'in\s+([^,\n]+?\.(?:pdf|docx?|xlsx?))'
+        ]
+        
+        for pattern in source_patterns:
+            matches = re.findall(pattern, response, re.IGNORECASE)
+            for match in matches:
+                # Clean up the filename
+                filename = match.strip()
+                if filename:
+                    referenced_docs.add(filename)
+        
+        # Also check for document names mentioned in the response
+        # Get all unique document names from enhanced metadata
+        all_doc_names = set()
+        for file_hash, file_metadata in enhanced_metadata.items():
+            doc_name = file_metadata.get('file_name', '')
+            if doc_name:
+                all_doc_names.add(doc_name)
+        
+        # Check if any document names are mentioned in the response
+        for doc_name in all_doc_names:
+            if doc_name.lower() in response.lower():
+                referenced_docs.add(doc_name)
+        
+        print(f"🔍 Documents referenced in response: {referenced_docs}")
+        
+        # Create document links only for referenced documents
+        for doc_name in referenced_docs:
+            # Find metadata for this document
+            web_view_link = ""
+            doc_type = "document"
+            
+            for file_hash, file_metadata in enhanced_metadata.items():
+                if file_metadata.get('file_name') == doc_name:
+                    web_view_link = file_metadata.get('web_view_link', '')
+                    doc_type = file_metadata.get('file_type', 'document')
+                    break
+            
+            document_links.append({
+                'name': doc_name,
+                'link': web_view_link,
+                'type': doc_type
+            })
+        
+        print(f"📄 Created {len(document_links)} document links for referenced documents")
         print("✅ Unified response generated successfully")
-        return response
+        return response, document_links
         
     except Exception as e:
         print(f"❌ Error in unified query system: {str(e)}")
-        return f"An error occurred while processing your query: {str(e)}"
+        return f"An error occurred while processing your query: {str(e)}", []
 
 # Main function commented out for bot compatibility
 # The bot manages its own UI and session state
