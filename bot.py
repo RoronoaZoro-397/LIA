@@ -12,6 +12,9 @@ import requests
 import os
 import json
 import hashlib
+import glob
+import pickle
+import time
 from datetime import datetime
 import tempfile
 from typing import Dict, List, Optional, Any
@@ -38,6 +41,9 @@ from metadata_handler import get_spacy_metadata_handler
 
 # Import image processor
 from image_processor import init_gemini, process_pdf_images
+
+# Import status updater
+from status_updater import process_query_with_simple_status, process_documents_with_simple_status
 
 # Import Google OAuth and Drive functionality
 from google.oauth2.credentials import Credentials
@@ -80,16 +86,42 @@ class RAGBotState:
     def get_user_session(self, user_id: str) -> Dict:
         """Get or create user session"""
         if user_id not in self.user_sessions:
+            # Try to load saved auth state
+            saved_auth = load_auth_state(user_id)
+            
             self.user_sessions[user_id] = {
-                'authenticated': False,
-                'credentials': None,
-                'user_info': None,
+                'authenticated': saved_auth.get('authenticated', False),
+                'credentials': None,  # Don't save credentials for security
+                'user_info': saved_auth.get('user_info'),
                 'chat_history': [],
-                'processed_documents': False,
-                'user_email': None,
-                'auth_step': 'not_started',  # not_started, waiting_auth, authenticated, processing
+                'processed_documents': saved_auth.get('processed_documents', False),
+                'user_email': saved_auth.get('user_email'),
+                'auth_step': saved_auth.get('auth_step', 'not_started'),
                 'oauth_flow': None
             }
+            
+            # If user was previously authenticated and documents were processed, 
+            # check if documents still exist
+            if (saved_auth.get('authenticated', False) and 
+                saved_auth.get('processed_documents', False)):
+                try:
+                    pdf_count = get_document_count(OPENSEARCH_INDEX)
+                    sheets_count = get_document_count(SHEETS_INDEX)
+                    if pdf_count > 0 or sheets_count > 0:
+                        print(f"✅ Auto-restored auth for user {user_id} - documents available")
+                    else:
+                        # Documents were cleared, reset auth state
+                        self.user_sessions[user_id]['authenticated'] = False
+                        self.user_sessions[user_id]['processed_documents'] = False
+                        self.user_sessions[user_id]['auth_step'] = 'not_started'
+                        print(f"⚠️ Auth restored but no documents found for user {user_id}")
+                except Exception as e:
+                    print(f"⚠️ Error checking documents for user {user_id}: {e}")
+                    # Reset auth state if we can't verify documents
+                    self.user_sessions[user_id]['authenticated'] = False
+                    self.user_sessions[user_id]['processed_documents'] = False
+                    self.user_sessions[user_id]['auth_step'] = 'not_started'
+        
         return self.user_sessions[user_id]
     
     def initialize_components(self):
@@ -111,6 +143,61 @@ class RAGBotState:
 # Global bot state
 rag_bot_state = RAGBotState()
 
+def save_auth_state(user_id: str, user_session: Dict):
+    """Save authentication state to disk"""
+    try:
+        auth_dir = "./auth_states"
+        os.makedirs(auth_dir, exist_ok=True)
+        
+        # Save only essential auth data (not sensitive credentials)
+        auth_data = {
+            'user_id': user_id,
+            'authenticated': user_session.get('authenticated', False),
+            'user_email': user_session.get('user_email'),
+            'user_info': user_session.get('user_info'),
+            'processed_documents': user_session.get('processed_documents', False),
+            'auth_step': user_session.get('auth_step', 'not_started'),
+            'saved_at': datetime.now().isoformat()
+        }
+        
+        auth_file = os.path.join(auth_dir, f"auth_{user_id}.pkl")
+        with open(auth_file, 'wb') as f:
+            pickle.dump(auth_data, f)
+        
+        print(f"✅ Saved auth state for user {user_id}")
+    except Exception as e:
+        print(f"❌ Error saving auth state: {e}")
+
+def load_auth_state(user_id: str) -> Dict:
+    """Load authentication state from disk"""
+    try:
+        auth_dir = "./auth_states"
+        auth_file = os.path.join(auth_dir, f"auth_{user_id}.pkl")
+        
+        if os.path.exists(auth_file):
+            with open(auth_file, 'rb') as f:
+                auth_data = pickle.load(f)
+            
+            print(f"✅ Loaded auth state for user {user_id}")
+            return auth_data
+        else:
+            return {}
+    except Exception as e:
+        print(f"❌ Error loading auth state: {e}")
+        return {}
+
+def clear_auth_state(user_id: str):
+    """Clear authentication state from disk"""
+    try:
+        auth_dir = "./auth_states"
+        auth_file = os.path.join(auth_dir, f"auth_{user_id}.pkl")
+        
+        if os.path.exists(auth_file):
+            os.remove(auth_file)
+            print(f"✅ Cleared auth state for user {user_id}")
+    except Exception as e:
+        print(f"❌ Error clearing auth state: {e}")
+
 def botJoinPrivateChatAction(bot, groupId, user, dbAction):
     """
     This is invoked when the bot is added to a private group.
@@ -120,14 +207,21 @@ def botJoinPrivateChatAction(bot, groupId, user, dbAction):
         {
             'text': 
             f'''
-            **Hello! I am your Document Assistant Bot. 🤖**
+            **Hello! I am LIA. **
             
             I can help you query your Google Drive documents, PDFs, and spreadsheets!
             
             **Setup Required:**
-            1. **Authenticate with Google** - Type "!auth" to start
-            2. **Process Documents** - Type "!process" after authentication
+            1. **Authenticate with Google** - Type "!auth" to start (only needed once)
+            2. **Process Documents** - Type "!process" after authentication (only needed once)
             3. **Start Querying** - Ask questions about your documents
+            
+            **Note:** If you were previously authenticated and documents are processed, you can start chatting directly!
+            
+            **Other Commands:**
+            - `!status` - Check current status
+            - `!reset` - Clear all data and start fresh
+            - `!clear` - Clear chat history
             
             **How to use me:**
             - Type "!auth" to authenticate with Google Drive
@@ -167,17 +261,20 @@ def botGotPostAddAction(
     
     # Check if user is asking for help
     if f'![:Person]({bot.id})' in text:
+        print(f"🔍 User asked for help: {text}")
         bot.sendMessage(
             groupId,
             {
                 'text': 
                 f'''
-                **Document Assistant Bot Help **
+                **Hello I am LIA your Document Assistant Bot **
                 
                 **Setup Commands:**
                 - `!auth` - Authenticate with Google Drive
                 - `!process` - Process your documents (after auth)
                 - `!status` - Check current status
+                - `!reset` - Clear all data and start fresh
+                - `!clear` - Clear chat history
                 
                 **What I can do:**
                 - Answer questions about your documents and spreadsheets
@@ -213,6 +310,16 @@ def botGotPostAddAction(
         handle_status_command(bot, groupId, creatorId, user_session)
         return
     
+    # Handle reset command
+    if text.lower() == "!reset":
+        handle_reset_command(bot, groupId, creatorId, user_session)
+        return
+    
+    # Handle clear chat command
+    if text.lower() == "!clear":
+        handle_clear_chat_command(bot, groupId, creatorId, user_session)
+        return
+    
     # Handle OAuth callback
     if user_session['auth_step'] == 'waiting_auth' and len(text) > 10 and 'http' not in text:
         handle_oauth_callback(bot, groupId, creatorId, user_session, text)
@@ -243,15 +350,21 @@ def botGotPostAddAction(
     
     # Check if we have the necessary components
     if not rag_bot_state.unified_retriever or not rag_bot_state.llm:
-        bot.sendMessage(
-            groupId,
-            {
-                'text': f'![:Person]({creatorId}), I\'m sorry, but the document processing system is not ready yet. Please ensure that documents have been processed and the system is properly configured.'
-            }
-        )
-        return
+        # Try to initialize components
+        if not rag_bot_state.initialized:
+            rag_bot_state.initialize_components()
+        
+        # Check again after initialization attempt
+        if not rag_bot_state.unified_retriever or not rag_bot_state.llm:
+            bot.sendMessage(
+                groupId,
+                {
+                    'text': f'![:Person]({creatorId}), I\'m sorry, but the document processing system is not ready yet. Please ensure that documents have been processed and the system is properly configured.'
+                }
+            )
+            return
     
-    # Process the user's query using the exact same backend as Streamlit
+    # Process the user's query with dynamic status updates
     try:
         # Add user message to chat history
         user_session['chat_history'].append({
@@ -266,33 +379,16 @@ def botGotPostAddAction(
         # Get user email for metadata queries
         user_email = user_session.get('user_email', 'unknown')
         
-        # Use the exact same query system as Streamlit app
-        response = query_unified_system(
-            text,
-            rag_bot_state.unified_retriever,
-            rag_bot_state.llm,
-            user_session['chat_history'],
-            user_email
-        )
-        
-        # Add assistant response to chat history
-        user_session['chat_history'].append({
-            "role": "assistant",
-            "content": response
-        })
-        
-        # Send response to user
-        bot.sendMessage(
-            groupId,
-            {
-                'text': f'![:Person]({creatorId}), {response}'
-            }
+        # Process query with status updates
+        response, document_links = process_query_with_simple_status(
+            bot, groupId, creatorId, text, user_session, rag_bot_state
         )
         
     except Exception as e:
         error_message = f"❌ Error processing your query: {str(e)}"
         print(f"Error in RAG bot: {str(e)}")
         
+        # Send error message
         bot.sendMessage(
             groupId,
             {
@@ -342,6 +438,9 @@ def handle_oauth_callback(bot, groupId, creatorId, user_session, authorization_c
             user_session['user_email'] = user_info.get('email', 'unknown')
             user_session['auth_step'] = 'authenticated'
             
+            # Save authentication state
+            save_auth_state(creatorId, user_session)
+            
             bot.sendMessage(
                 groupId,
                 {
@@ -365,6 +464,152 @@ def handle_oauth_callback(bot, groupId, creatorId, user_session, authorization_c
             }
         )
 
+def handle_reset_command(bot, groupId, creatorId, user_session):
+    """Handle database reset command"""
+    try:
+        bot.sendMessage(
+            groupId,
+            {
+                'text': f'![:Person]({creatorId}), 🧹 Starting database reset...\n\nThis will clear all processed documents and metadata. Please wait...'
+            }
+        )
+        
+        # 1. Remove user metadata files
+        metadata_files = glob.glob("./vectorstores/user_*_metadata.json")
+        removed_count = 0
+        for file in metadata_files:
+            try:
+                os.remove(file)
+                removed_count += 1
+            except Exception as e:
+                print(f"❌ Error removing {file}: {e}")
+        
+        # 1.5. Clear all auth states
+        auth_files = glob.glob("./auth_states/auth_*.pkl")
+        auth_cleared = 0
+        for file in auth_files:
+            try:
+                os.remove(file)
+                auth_cleared += 1
+            except Exception as e:
+                print(f"❌ Error removing {file}: {e}")
+        
+        # 2. Clear OpenSearch indices
+        try:
+            # Get list of indices
+            response = requests.get("http://localhost:9200/_cat/indices?format=json", timeout=5)
+            if response.status_code == 200:
+                indices = response.json()
+                deleted_indices = []
+                for index in indices:
+                    index_name = index['index']
+                    if 'multimodal_documents' in index_name or 'document_embeddings' in index_name or 'sheets_embeddings' in index_name or 'file_metadata' in index_name:
+                        # Delete the index
+                        delete_response = requests.delete(f"http://localhost:9200/{index_name}", timeout=5)
+                        if delete_response.status_code in [200, 404]:
+                            deleted_indices.append(index_name)
+                        else:
+                            print(f"❌ Failed to delete index {index_name}: {delete_response.status_code}")
+                
+                indices_deleted = len(deleted_indices)
+            else:
+                indices_deleted = 0
+        except Exception as e:
+            print(f"ℹ️  OpenSearch not running or not accessible: {e}")
+            indices_deleted = 0
+        
+        # 3. Clear any temporary files
+        temp_patterns = [
+            "./*.tmp",
+            "./*.cache",
+            "./temp_*",
+            "./tmp_*"
+        ]
+        
+        temp_files_removed = 0
+        for pattern in temp_patterns:
+            temp_files = glob.glob(pattern)
+            for file in temp_files:
+                try:
+                    os.remove(file)
+                    temp_files_removed += 1
+                except Exception as e:
+                    pass
+        
+        # 4. Clear Python cache
+        cache_dirs = glob.glob("./**/__pycache__", recursive=True)
+        cache_cleared = 0
+        for cache_dir in cache_dirs:
+            try:
+                import shutil
+                shutil.rmtree(cache_dir)
+                cache_cleared += 1
+            except Exception as e:
+                pass
+        
+        # 5. Reset user session
+        user_session['authenticated'] = False
+        user_session['credentials'] = None
+        user_session['user_info'] = None
+        user_session['chat_history'] = []
+        user_session['processed_documents'] = False
+        user_session['user_email'] = None
+        user_session['auth_step'] = 'not_started'
+        user_session['oauth_flow'] = None
+        
+        # Clear saved auth state
+        clear_auth_state(creatorId)
+        
+        # 6. Reset global bot state
+        rag_bot_state.unified_retriever = None
+        rag_bot_state.llm = None
+        rag_bot_state.initialized = False
+        
+        bot.sendMessage(
+            groupId,
+            {
+                'text': f'![:Person]({creatorId}), ✅ Database reset complete!\n\n📊 Reset Summary:\n• Removed {removed_count} metadata files\n• Deleted {indices_deleted} OpenSearch indices\n• Cleared {temp_files_removed} temporary files\n• Cleared {cache_cleared} cache directories\n• Cleared {auth_cleared} auth states\n\n🔄 All processed documents and metadata have been cleared.\n\nTo start fresh:\n1. Type "!auth" to authenticate with Google Drive\n2. Type "!process" to process your documents again'
+            }
+        )
+        
+    except Exception as e:
+        bot.sendMessage(
+            groupId,
+            {
+                'text': f'![:Person]({creatorId}), ❌ Error during reset: {str(e)}'
+            }
+        )
+
+def handle_clear_chat_command(bot, groupId, creatorId, user_session):
+    """Handle clear chat command"""
+    try:
+        # Clear the chat history for this user
+        user_session['chat_history'] = []
+        
+        # Try to clear RingCentral chat messages (this is limited by API permissions)
+        try:
+            # Note: RingCentral API doesn't provide a direct way to delete messages
+            # This would require admin permissions and specific API endpoints
+            # For now, we'll just clear the bot's internal chat history
+            pass
+        except Exception as e:
+            print(f"Note: Cannot clear RingCentral chat messages: {e}")
+        
+        bot.sendMessage(
+            groupId,
+            {
+                'text': f'![:Person]({creatorId}), 🗑️ Chat history cleared!\n\nYour conversation history has been reset. You can continue asking questions about your documents.\n\nNote: Previous messages in this chat remain visible but are no longer used for context.'
+            }
+        )
+        
+    except Exception as e:
+        bot.sendMessage(
+            groupId,
+            {
+                'text': f'![:Person]({creatorId}), ❌ Error clearing chat: {str(e)}'
+            }
+        )
+
 def handle_process_command(bot, groupId, creatorId, user_session):
     """Handle document processing"""
     if not user_session['authenticated']:
@@ -378,32 +623,28 @@ def handle_process_command(bot, groupId, creatorId, user_session):
     
     try:
         user_session['auth_step'] = 'processing'
-        bot.sendMessage(
-            groupId,
-            {
-                'text': f'![:Person]({creatorId}), 🔄 Starting document processing...\n\nThis may take a few minutes depending on the number of documents in your Google Drive.'
-            }
-        )
         
-        # Use your Streamlit processing function
-        process_all_user_documents_unified(
-            user_session['credentials'], 
-            user_session['user_email']
+        # Process documents with status updates
+        process_documents_with_simple_status(
+            bot, groupId, creatorId, user_session['credentials'], user_session['user_email']
         )
         
         user_session['processed_documents'] = True
         user_session['auth_step'] = 'ready'
         
-        # Get document counts
+        # Save updated state after processing
+        save_auth_state(creatorId, user_session)
+        
+        # Initialize components after processing documents
+        if not rag_bot_state.initialized:
+            rag_bot_state.initialize_components()
+        
+        # Get document counts for final message
         pdf_count = get_document_count(OPENSEARCH_INDEX)
         sheets_count = get_document_count(SHEETS_INDEX)
         
-        bot.sendMessage(
-            groupId,
-            {
-                'text': f'![:Person]({creatorId}), ✅ Document processing complete!\n\n📊 Processed:\n- {pdf_count} PDF/Doc chunks\n- {sheets_count} Sheet chunks\n\nYou can now ask questions about your documents!'
-            }
-        )
+        # Document processing is now handled by the status updater function
+        # The final success message is sent automatically
         
     except Exception as e:
         user_session['auth_step'] = 'authenticated'
@@ -439,7 +680,7 @@ def handle_status_command(bot, groupId, creatorId, user_session):
         status_text += "📊 **Document chunks:** Unable to retrieve\n"
     
     # Bot status
-    if rag_bot_state.initialized:
+    if rag_bot_state.initialized and rag_bot_state.unified_retriever and rag_bot_state.llm:
         status_text += "✅ **Bot ready**\n"
     else:
         status_text += "❌ **Bot not ready**\n"
